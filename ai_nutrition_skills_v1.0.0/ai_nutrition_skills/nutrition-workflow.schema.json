@@ -1,0 +1,658 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/schemas/nutrition-workflow.schema.json",
+  "title": "AI Nutrition Workflow Contract",
+  "description": "Shared payload contract for composition analysis, source verification, and nutrition reporting. Replace the example.invalid $id with a project-owned stable schema URL before publication.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "stage",
+    "meal_id",
+    "status"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0"
+    },
+    "stage": {
+      "enum": [
+        "composition",
+        "verification",
+        "report"
+      ]
+    },
+    "meal_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "status": {
+      "enum": [
+        "needs_user_input",
+        "needs_user_confirmation",
+        "user_confirmed",
+        "in_progress",
+        "complete",
+        "partial",
+        "failed"
+      ]
+    },
+    "locale": {
+      "type": "string",
+      "default": "zh-TW"
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "user_text": {
+      "type": "string"
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/compositionItem"
+      }
+    },
+    "needs_confirmation": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_candidates": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/sourceCandidate"
+      }
+    },
+    "verified_items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/verifiedItem"
+      }
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/source"
+      }
+    },
+    "meal_summary": {
+      "type": "string"
+    },
+    "item_reports": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/itemReport"
+      }
+    },
+    "totals": {
+      "$ref": "#/$defs/nutrientSet"
+    },
+    "limitations": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "source_references": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/error"
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "prompt_version": {
+          "type": "string"
+        },
+        "image_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "confirmation_timestamp": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "calculation_version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "stage": {
+            "const": "composition"
+          }
+        },
+        "required": [
+          "stage"
+        ]
+      },
+      "then": {
+        "required": [
+          "items"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {
+            "const": "verification"
+          }
+        },
+        "required": [
+          "stage"
+        ]
+      },
+      "then": {
+        "required": [
+          "verified_items",
+          "sources"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "stage": {
+            "const": "report"
+          }
+        },
+        "required": [
+          "stage"
+        ]
+      },
+      "then": {
+        "required": [
+          "item_reports",
+          "totals",
+          "limitations"
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "compositionItem": {
+      "type": "object",
+      "required": [
+        "item_id",
+        "name",
+        "identification_confidence",
+        "uncertainty"
+      ],
+      "properties": {
+        "item_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "candidate_names": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "preparation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ingredients": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "estimated_weight_g": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "confirmed_weight_g": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "portion_description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "identification_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "portion_confidence": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "uncertainty": {
+          "enum": [
+            "low",
+            "medium",
+            "high"
+          ]
+        },
+        "field_origins": {
+          "type": "object",
+          "additionalProperties": {
+            "enum": [
+              "ai_estimated",
+              "user_provided",
+              "user_confirmed",
+              "source_verified",
+              "database"
+            ]
+          }
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "sourceCandidate": {
+      "type": "object",
+      "required": [
+        "candidate_type",
+        "candidate_name",
+        "verification_status"
+      ],
+      "properties": {
+        "candidate_type": {
+          "enum": [
+            "brand",
+            "restaurant",
+            "packaged_product",
+            "menu_item",
+            "other"
+          ]
+        },
+        "candidate_name": {
+          "type": "string"
+        },
+        "evidence": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
+        },
+        "verification_status": {
+          "enum": [
+            "candidate",
+            "verified",
+            "rejected",
+            "unresolved"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "source_id",
+        "source_type",
+        "source_name",
+        "evidence_status"
+      ],
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "source_type": {
+          "enum": [
+            "official_brand",
+            "official_restaurant",
+            "official_label",
+            "government_database",
+            "reputable_database",
+            "calculated_estimate",
+            "other"
+          ]
+        },
+        "source_name": {
+          "type": "string"
+        },
+        "source_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "uri"
+        },
+        "retrieved_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "published_or_updated_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence_status": {
+          "enum": [
+            "official_verified",
+            "database_matched",
+            "estimated",
+            "unresolved",
+            "search_result_only"
+          ]
+        },
+        "match_basis": {
+          "type": "string"
+        },
+        "reference_amount": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "reference_unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "nutrientValue": {
+      "type": "object",
+      "required": [
+        "value",
+        "unit"
+      ],
+      "properties": {
+        "value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "unit": {
+          "enum": [
+            "kcal",
+            "kJ",
+            "g",
+            "mg",
+            "µg",
+            "IU"
+          ]
+        },
+        "basis": {
+          "enum": [
+            "per_100_g",
+            "per_100_ml",
+            "per_serving",
+            "per_package",
+            "consumed_amount",
+            "unknown"
+          ]
+        },
+        "original_value": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "original_unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "conversion_note": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "nutrientSet": {
+      "type": "object",
+      "properties": {
+        "energy": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "protein": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "carbohydrate": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "total_sugars": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "added_sugars": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "fat": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "saturated_fat": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "fiber": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "sodium": {
+          "$ref": "#/$defs/nutrientValue"
+        },
+        "cholesterol": {
+          "$ref": "#/$defs/nutrientValue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "verifiedItem": {
+      "type": "object",
+      "required": [
+        "item_id",
+        "name",
+        "evidence_status",
+        "match_confidence",
+        "nutrients",
+        "source_ids"
+      ],
+      "properties": {
+        "item_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "preparation": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "consumed_weight_g": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "reference_amount": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "exclusiveMinimum": 0
+        },
+        "reference_unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence_status": {
+          "enum": [
+            "official_verified",
+            "database_matched",
+            "estimated",
+            "unresolved"
+          ]
+        },
+        "match_confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "match_notes": {
+          "type": "string"
+        },
+        "nutrients": {
+          "$ref": "#/$defs/nutrientSet"
+        },
+        "source_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "unresolved_fields": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "itemReport": {
+      "type": "object",
+      "required": [
+        "item_id",
+        "name",
+        "evidence_status",
+        "nutrients",
+        "source_ids"
+      ],
+      "properties": {
+        "item_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "consumed_amount": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "consumed_unit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "consumed_weight_g": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "evidence_status": {
+          "enum": [
+            "official_verified",
+            "database_matched",
+            "estimated",
+            "unresolved"
+          ]
+        },
+        "nutrients": {
+          "$ref": "#/$defs/nutrientSet"
+        },
+        "source_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "uncertainty_notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "recoverable"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "recoverable": {
+          "type": "boolean"
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "suggested_action": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}
