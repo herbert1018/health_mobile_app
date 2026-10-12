@@ -1,9 +1,36 @@
+
+# Node.js dependencies
 node_modules/
+
+# Expo temporary files
+.expo/
+dist/
+web-build/
+
+# Local environment variables and secrets
 .env
 .env.*
 !.env.example
-dist/
-build/
-.expo/
+*.local
+
+# EAS local credentials
+credentials.json
+*.keystore
+*.jks
+
+# Debug logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# TypeScript generated files
+*.tsbuildinfo
+
+# OS generated files
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# Editor settings
+.vscode/*
+!.vscode/extensions.json

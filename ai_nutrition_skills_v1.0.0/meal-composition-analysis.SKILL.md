@@ -56,12 +56,19 @@ product name.
     -   Separate distinct foods rather than collapsing an entire mixed
         plate into one item when components can reasonably be
         distinguished.
-    -   For mixed dishes, identify the dish and list ingredients only
-        when visually supportable; mark uncertain ingredients as
-        candidates.
+    -   For mixed dishes, identify the dish and list visually
+        supportable internal ingredients in `ingredients`; place
+        plausible but unconfirmed ingredients in `candidate_names`.
+    -   Leave `ingredients` empty for a simple food when no internal
+        ingredients can be distinguished. Never infer a full recipe
+        from the dish name alone.
 3.  **Estimate portion cautiously**
-    -   Provide an approximate mass in grams only if the image/context
-        supports an estimate.
+    -   For each separately listed food item, actively consider an
+        approximate mass in grams and provide `estimated_weight_g` when
+        the image/context supports an estimate.
+    -   Clearly label this as an AI estimate, not a measurement.
+        Estimate item weights independently; do not distribute a plate
+        total evenly among items without evidence.
     -   Otherwise set `estimated_weight_g` to `null`, provide a
         qualitative serving description if useful, and ask the user to
         confirm.
@@ -104,8 +111,10 @@ Return JSON conforming to `nutrition-workflow.schema.json` with: -
 
 Each item should include: - stable `item_id` - `name` - optional
 `preparation` - optional `estimated_weight_g` (number or null) -
-optional `portion_description` - `identification_confidence` (0--1) -
-`uncertainty` - field-level `field_origins` where practical
+optional `portion_description` - `ingredients` for visually supported
+internal ingredients - `candidate_names` for plausible but unconfirmed
+ingredients - `identification_confidence` (0--1) - `uncertainty` -
+field-level `field_origins` where practical
 
 ## Error handling
 
