@@ -117,10 +117,12 @@ export function generateNutritionReport(
       throw new Error(`VERIFICATION_MISSING：缺少 ${item.name} 的查證結果。`);
     }
 
-    const weight = item.confirmed_weight_g ?? item.estimated_weight_g ?? null;
-    if (weight !== null && !isFiniteNonNegative(weight)) {
+    const rawWeight = item.confirmed_weight_g ?? item.estimated_weight_g ?? null;
+    if (rawWeight !== null && !isFiniteNonNegative(rawWeight)) {
       throw new Error(`CALCULATION_INVALID：${item.name} 的重量無效。`);
     }
+    // 0 g 視為未知重量，避免被算成「攝取 0」。
+    const weight = rawWeight !== null && rawWeight > 0 ? rawWeight : null;
 
     const nutrients: NutritionSet = {};
     const uncertaintyNotes: string[] = [];

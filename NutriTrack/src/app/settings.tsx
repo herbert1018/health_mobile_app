@@ -229,12 +229,6 @@ export default function SettingsScreen() {
         </Pressable>
         </View>
 
-
-          <Text style={styles.description}>
-            輸入你自己的 Gemini API Key，即可使用 AI 食物照片辨識。
-            金鑰會儲存在這台裝置的安全儲存區，不會寫入一般飲食紀錄。
-          </Text>
-
           <View style={styles.statusCard}>
             <Text style={styles.statusLabel}>目前狀態</Text>
             <Text style={styles.statusValue}>
@@ -298,14 +292,6 @@ export default function SettingsScreen() {
             </Pressable>
           )}
 
-            <View style={styles.notice}>
-                <Text style={styles.noticeTitle}>安全提醒</Text>
-                <Text style={styles.noticeText}>
-                請勿將 API Key 分享給他人或提交至 Git。
-                使用 Gemini API 可能受到 Google 的服務條款、
-                資料處理政策及使用額度限制。
-                </Text>
-            </View>
             <View style={styles.targetCard}>
             <View style={styles.autoClearCard}>
               <View style={styles.autoClearHeader}>
@@ -342,7 +328,7 @@ export default function SettingsScreen() {
             <Text style={styles.targetTitle}>每日營養目標</Text>
 
             <Text style={styles.targetDescription}>
-                自訂每日攝取目標，儲存後會套用到首頁與 AI 營養報告。
+                自訂儲存後會套用到首頁與 AI 營養報告。
             </Text>
 
             {targetsLoading ? (

@@ -1,6 +1,9 @@
 import {
-  GEMINI_CANDIDATE_MODELS,
+  getCandidateModels,
   getStoredApiKey,
+  isTimeoutError,
+  markModelSlow,
+  timedFetch,
   type CompositionItem,
 } from './gemini';
 
@@ -105,6 +108,9 @@ export type NutritionVerificationResult = {
     model: string;
     retrieved_at: string | null;
     grounding_source_count: number;
+    grounding_state?: 'not_invoked' | 'no_results' | 'ok';
+    grounding_queries?: string[];
+    grounding_finish_reason?: string | null;
   };
 };
 
@@ -125,6 +131,9 @@ type GroundingChunk = {
 
 type RawSourceReference = {
   url: string;
+  host?: string;
+  match_level?: 'exact' | 'normalized' | 'host';
+  model_url?: string;
   source_type: NutritionSource['source_type'];
   evidence_status: NutritionSource['evidence_status'];
   match_basis: string;
@@ -190,41 +199,121 @@ function asTrimmedString(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
-function isGroundedUrl(value: unknown, groundedUrls: Set<string>): value is string {
+function hostOf(value: unknown): string | null {
   if (typeof value !== 'string') {
-    return false;
+    return null;
   }
-
   try {
-    const parsed = new URL(value);
-    return parsed.protocol === 'https:' && groundedUrls.has(value);
+    const parsed = new URL(value.includes('://') ? value : `https://${value}`);
+    if (parsed.protocol !== 'https:') {
+      return null;
+    }
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    return host.includes('.') ? host : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
-function isGovernmentFoodDatabase(url: string): boolean {
-  const hostname = new URL(url).hostname.toLowerCase();
+function isPrivateHost(host: string): boolean {
   return (
-    hostname === 'fdc.nal.usda.gov' ||
-    hostname === 'foodlabel.fda.gov.tw' ||
-    (hostname === 'data.gov.tw' && new URL(url).pathname.includes('8543'))
+    host === 'localhost' ||
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) ||
+    host.endsWith('.local') ||
+    host.endsWith('.internal')
   );
 }
 
+// 去掉 www、查詢參數、錨點與結尾斜線後再比較。
+function normalizeUrl(value: string): string | null {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== 'https:') {
+      return null;
+    }
+    const host = parsed.hostname.toLowerCase().replace(/^www\./, '');
+    return `${host}${parsed.pathname.replace(/\/+$/, '')}`;
+  } catch {
+    return null;
+  }
+}
+
+type GroundedChunk = { url: string; title: string | undefined };
+
+/**
+ * 把模型回報的網址對應到真正由 Google Search 回傳的來源。
+ * Gemini 的 grounding 網址常是 Google 的轉址連結（title 才是來源網域），
+ * 所以除了完全相同，也接受「正規化後相同」與「網域相同」。
+ * 網域相同時改用 grounding 回傳的連結，避免採用模型自行猜測的網址路徑。
+ */
+function resolveGroundedReference(
+  modelUrl: unknown,
+  chunks: GroundedChunk[],
+): { url: string; host: string; level: 'exact' | 'normalized' | 'host' } | null {
+  if (typeof modelUrl !== 'string') {
+    return null;
+  }
+  const modelHost = hostOf(modelUrl);
+  if (!modelHost || isPrivateHost(modelHost)) {
+    return null;
+  }
+
+  const exact = chunks.find((chunk) => chunk.url === modelUrl);
+  if (exact) {
+    return { url: modelUrl, host: modelHost, level: 'exact' };
+  }
+
+  const normalizedModel = normalizeUrl(modelUrl);
+  if (normalizedModel) {
+    const normalized = chunks.find((chunk) => normalizeUrl(chunk.url) === normalizedModel);
+    if (normalized) {
+      return { url: modelUrl, host: modelHost, level: 'normalized' };
+    }
+  }
+
+  const sameHost = chunks.find((chunk) => {
+    const titleHost = hostOf(chunk.title);
+    return titleHost != null && titleHost === modelHost;
+  });
+  if (sameHost) {
+    return { url: sameHost.url, host: modelHost, level: 'host' };
+  }
+
+  return null;
+}
+
+function isGovernmentFoodDatabase(reference: {
+  url: string;
+  host?: string;
+  match_level?: string;
+}): boolean {
+  const host = reference.host ?? hostOf(reference.url);
+  if (host === 'fdc.nal.usda.gov' || host === 'foodlabel.fda.gov.tw') {
+    return true;
+  }
+  // data.gov.tw 必須確認到具體資料集頁面，網域相同不夠。
+  if (host === 'data.gov.tw' && reference.match_level !== 'host') {
+    try {
+      return new URL(reference.url).pathname.includes('8543');
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
 function sourceTypeForHost(
-  url: string,
-  proposedType: NutritionSource['source_type'],
+  reference: RawSourceReference,
 ): NutritionSource['source_type'] {
-  if (isGovernmentFoodDatabase(url)) {
+  if (isGovernmentFoodDatabase(reference)) {
     return 'government_database';
   }
 
-  if (proposedType === 'government_database') {
+  if (reference.source_type === 'government_database') {
     return 'other';
   }
 
-  return proposedType;
+  return reference.source_type;
 }
 
 function evidenceStatusForReference(
@@ -235,19 +324,20 @@ function evidenceStatusForReference(
   }
 
   if (
-    isGovernmentFoodDatabase(reference.url) &&
+    isGovernmentFoodDatabase(reference) &&
     ['database_matched', 'official_verified'].includes(reference.evidence_status)
   ) {
     return 'database_matched';
   }
 
+  // 只有網域相同、沒有確認到具體頁面時，最高只給「資料庫匹配」，不給「官方查證」。
   if (
     ['official_brand', 'official_restaurant', 'official_label'].includes(
       reference.source_type,
     ) &&
     reference.evidence_status === 'official_verified'
   ) {
-    return 'official_verified';
+    return reference.match_level === 'host' ? 'database_matched' : 'official_verified';
   }
 
   if (
@@ -438,30 +528,58 @@ function buildVerificationPrompt(composition: ConfirmedComposition): string {
 async function requestGroundedJson(
   apiKey: string,
   prompt: string,
-): Promise<{ draft: any; chunks: GroundingChunk[]; model: string }> {
+): Promise<{
+  draft: any;
+  chunks: GroundingChunk[];
+  model: string;
+  grounding: {
+    state: 'not_invoked' | 'no_results' | 'ok';
+    queries: string[];
+    finish_reason: string | null;
+  };
+}> {
   const failures: string[] = [];
 
-  for (const model of GEMINI_CANDIDATE_MODELS) {
+  const models = getCandidateModels();
+  for (const model of models) {
     const endpoint =
       `https://generativelanguage.googleapis.com/v1beta/models/` +
       `${model}:generateContent`;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          tools: [{ google_search: {} }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.1,
+      let response: Response;
+      try {
+  response = await timedFetch('verify_grounded', model, attempt, endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': apiKey,
           },
-        }),
-      });
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            tools: [{ google_search: {} }],
+            generationConfig: {
+              responseMimeType: 'application/json',
+              temperature: 0.1,
+            },
+          }),
+
+        });
+      } catch (error) {
+        if (isTimeoutError(error)) {
+          markModelSlow(model);
+          failures.push(`${model}: 逾時`);
+          if (model !== models[models.length - 1]) {
+            break;
+          }
+          const timeoutFailure = new Error(
+            `營養查證的候選模型都逾時未回應：${failures.join('；')}`,
+          );
+          (timeoutFailure as Error & { code?: string }).code = 'TIMEOUT';
+          throw timeoutFailure;
+        }
+        throw error;
+      }
 
       let result: any;
       try {
@@ -489,7 +607,7 @@ async function requestGroundedJson(
 
         if (isQuotaLimited || isModelUnavailable) {
           failures.push(`${model} (HTTP ${response.status}): ${message}`);
-          if (model !== GEMINI_CANDIDATE_MODELS[GEMINI_CANDIDATE_MODELS.length - 1]) {
+          if (model !== models[models.length - 1]) {
             break;
           }
 
@@ -507,7 +625,7 @@ async function requestGroundedJson(
 
         if (isOverloaded) {
           failures.push(`${model} (HTTP ${response.status}): ${message}`);
-          if (model !== GEMINI_CANDIDATE_MODELS[GEMINI_CANDIDATE_MODELS.length - 1]) {
+          if (model !== models[models.length - 1]) {
             break;
           }
 
@@ -538,7 +656,32 @@ async function requestGroundedJson(
         ? candidate.groundingMetadata.groundingChunks
         : [];
 
-      return { draft, chunks, model };
+      const metadata = candidate?.groundingMetadata;
+      const queries: string[] = Array.isArray(metadata?.webSearchQueries)
+        ? metadata.webSearchQueries.filter((q: unknown): q is string => typeof q === 'string')
+        : [];
+      const grounding = {
+        state: !metadata
+          ? ('not_invoked' as const)
+          : chunks.length > 0
+            ? ('ok' as const)
+            : ('no_results' as const),
+        queries,
+        finish_reason:
+          typeof candidate?.finishReason === 'string' ? candidate.finishReason : null,
+      };
+      console.log(
+        '[NutriTrack][grounding]',
+        JSON.stringify({
+          model,
+          state: grounding.state,
+          query_count: queries.length,
+          chunk_count: chunks.length,
+          finish_reason: grounding.finish_reason,
+        }),
+      );
+
+      return { draft, chunks, model, grounding };
     }
   }
 
@@ -548,6 +691,9 @@ async function requestGroundedJson(
 }
 
 function isGroundingQuotaFailure(error: unknown): boolean {
+  if (isTimeoutError(error)) {
+    return true;
+  }
   const message = error instanceof Error ? error.message : String(error);
   return /quota|額度|429|RESOURCE_EXHAUSTED|rate limit|所有營養查證候選模型目前都無法服務|候選模型額度不足/i.test(
     message,
@@ -599,26 +745,38 @@ async function requestEstimatedJson(
 ): Promise<{ draft: any; model: string }> {
   const failures: string[] = [];
 
-  for (const model of GEMINI_CANDIDATE_MODELS) {
+  const models = getCandidateModels();
+  for (const model of models) {
     const endpoint =
       `https://generativelanguage.googleapis.com/v1beta/models/` +
       `${model}:generateContent`;
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt += 1) {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.1,
+      let response: Response;
+      try {
+  response = await timedFetch('verify_estimate', model, attempt, endpoint, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': apiKey,
           },
-        }),
-      });
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: {
+              responseMimeType: 'application/json',
+              temperature: 0.1,
+            },
+          }),
+
+        });
+      } catch (error) {
+        if (isTimeoutError(error)) {
+          markModelSlow(model);
+          failures.push(`${model}: 逾時`);
+          break;
+        }
+        throw error;
+      }
 
       let result: any;
       try {
@@ -842,7 +1000,7 @@ function buildUnresolvedVerification(
   };
 }
 
-export async function verifyNutritionSources(
+async function runNutritionVerification(
   composition: ConfirmedComposition,
 ): Promise<NutritionVerificationResult> {
   if (composition.status !== 'user_confirmed') {
@@ -851,51 +1009,6 @@ export async function verifyNutritionSources(
 
   if (!composition.items.length) {
     throw new Error('沒有可查證的食物項目。');
-  }
-
-  const itemsWithoutWeight = composition.items.filter(
-    (item) => item.confirmed_weight_g == null && item.estimated_weight_g == null,
-  );
-  if (itemsWithoutWeight.length > 0) {
-    return {
-      schema_version: '1.0.0',
-      stage: 'verification',
-      meal_id: composition.meal_id,
-      status: 'needs_user_input',
-      verified_items: composition.items.map((item) => ({
-        item_id: item.item_id,
-        name: item.name,
-        preparation: item.preparation ?? null,
-        consumed_weight_g: item.confirmed_weight_g ?? item.estimated_weight_g ?? null,
-        reference_amount: null,
-        reference_unit: null,
-        evidence_status: 'unresolved',
-        match_confidence: 0,
-        match_notes:
-          item.confirmed_weight_g == null && item.estimated_weight_g == null
-            ? '份量尚未確認；依查證 Skill 暫停營養來源查證。'
-            : '查證因同餐另一項份量未確認而暫停。',
-        nutrients: {},
-        source_ids: [],
-        unresolved_fields:
-          item.confirmed_weight_g == null && item.estimated_weight_g == null
-            ? ['consumed_weight_g']
-            : ['verification_not_run_due_to_unresolved_portion'],
-      })),
-      sources: [],
-      errors: itemsWithoutWeight.map((item) => ({
-        code: 'PORTION_UNCERTAIN',
-        message: `${item.name} 沒有可用重量估計，請輸入確認重量後再查證。`,
-        recoverable: true,
-        item_id: item.item_id,
-        suggested_action: '輸入合理重量；不可填入未測量的精確值。',
-      })),
-      metadata: {
-        model: 'not_called',
-        retrieved_at: null,
-        grounding_source_count: 0,
-      },
-    };
   }
 
   const apiKey = await getStoredApiKey();
@@ -939,7 +1052,7 @@ export async function verifyNutritionSources(
     }
   }
 
-  const { draft, chunks, model } = searchResult;
+  const { draft, chunks, model, grounding } = searchResult;
 
   if (!Array.isArray(draft?.items)) {
     throw new Error('營養來源查證缺少 items 清單，無法建立可追溯結果。');
@@ -968,17 +1081,31 @@ export async function verifyNutritionSources(
       continue;
     }
 
-    const references = item.source_references.filter(
-      (reference: any): reference is RawSourceReference =>
-        reference &&
-        isGroundedUrl(reference.url, groundedUrls) &&
-        typeof reference.source_type === 'string' &&
-        allowedSourceTypes.has(reference.source_type) &&
-        typeof reference.evidence_status === 'string' &&
-        allowedEvidenceStatuses.has(reference.evidence_status) &&
-        typeof reference.match_basis === 'string' &&
-        reference.match_basis.trim().length > 0,
-    );
+    const references: RawSourceReference[] = [];
+    for (const reference of item.source_references as any[]) {
+      if (
+        !reference ||
+        typeof reference.source_type !== 'string' ||
+        !allowedSourceTypes.has(reference.source_type) ||
+        typeof reference.evidence_status !== 'string' ||
+        !allowedEvidenceStatuses.has(reference.evidence_status) ||
+        typeof reference.match_basis !== 'string' ||
+        reference.match_basis.trim().length === 0
+      ) {
+        continue;
+      }
+      const resolved = resolveGroundedReference(reference.url, groundedChunks);
+      if (!resolved) {
+        continue;
+      }
+      references.push({
+        ...reference,
+        url: resolved.url,
+        host: resolved.host,
+        match_level: resolved.level,
+        model_url: reference.url,
+      } as RawSourceReference);
+    }
     sourceReferencesByItem.set(item.item_id, references);
   }
 
@@ -989,13 +1116,14 @@ export async function verifyNutritionSources(
       continue;
     }
 
-    const chunk = groundedChunks.find((candidate) => candidate.url === reference.url);
+    const chunk = groundedChunks.find((candidate) => candidate.url === reference.url) ??
+      groundedChunks.find((candidate) => hostOf(candidate.title) === reference.host);
     const sourceId = `nutrition_source_${sources.length + 1}`;
     sourceIdByUrl.set(reference.url, sourceId);
     sources.push({
       source_id: sourceId,
-      source_type: sourceTypeForHost(reference.url, reference.source_type),
-      source_name: chunk?.title || new URL(reference.url).hostname,
+      source_type: sourceTypeForHost(reference),
+      source_name: chunk?.title || reference.host || new URL(reference.url).hostname,
       source_url: reference.url,
       retrieved_at: retrievedAt,
       published_or_updated_at: null,
@@ -1007,7 +1135,14 @@ export async function verifyNutritionSources(
           ? reference.reference_amount
           : null,
       reference_unit: asTrimmedString(reference.reference_unit),
-      notes: reference.notes || '',
+      notes: [
+        reference.notes || '',
+        reference.match_level === 'host'
+          ? '來源網域與搜尋結果相符，連結採用搜尋工具回傳的網址。'
+          : '',
+      ]
+        .filter(Boolean)
+        .join(' '),
     });
   }
 
@@ -1019,17 +1154,21 @@ export async function verifyNutritionSources(
       .filter((sourceId): sourceId is string => Boolean(sourceId));
     const hasGroundedEvidence = sourceIds.length > 0;
     const claimedStatus = raw?.evidence_status;
-    const evidenceStatus: VerificationEvidenceStatus =
-      !hasGroundedEvidence ||
-      !['official_verified', 'database_matched', 'estimated', 'unresolved'].includes(
-        String(claimedStatus),
-      ) ||
-      claimedStatus === 'estimated' ||
-      !validReferences.some(
-        (reference) => evidenceStatusForReference(reference) === claimedStatus,
-      )
-        ? 'unresolved'
-        : claimedStatus as VerificationEvidenceStatus;
+    const referenceStatuses = validReferences.map((reference) =>
+      evidenceStatusForReference(reference),
+    );
+    let evidenceStatus: VerificationEvidenceStatus = 'unresolved';
+    if (
+      hasGroundedEvidence &&
+      ['official_verified', 'database_matched'].includes(String(claimedStatus))
+    ) {
+      if (referenceStatuses.includes(claimedStatus as NutritionSource['evidence_status'])) {
+        evidenceStatus = claimedStatus as VerificationEvidenceStatus;
+      } else if (referenceStatuses.includes('database_matched')) {
+        // 模型宣稱官方查證，但來源只能支持到資料庫匹配時，降級而不是整項丟棄。
+        evidenceStatus = 'database_matched';
+      }
+    }
 
     const referenceAmount = isFiniteNonNegative(raw?.reference_amount)
       ? raw.reference_amount
@@ -1116,7 +1255,17 @@ export async function verifyNutritionSources(
           item_id: item.item_id,
           suggested_action: '檢視下方資料庫來源與匹配依據。',
       })),
-      ...(groundedUrls.size === 0
+      ...(grounding.state === 'not_invoked'
+        ? [
+            {
+              code: 'GROUNDING_NOT_INVOKED',
+              message: '模型沒有執行 Google 搜尋；營養值已保留為未知。',
+              recoverable: true,
+              suggested_action: '稍後重新查證；若持續發生，請確認模型支援搜尋工具。',
+            },
+          ]
+        : []),
+      ...(grounding.state === 'no_results' || (grounding.state === 'ok' && groundedUrls.size === 0)
         ? [
             {
               code: 'WEB_EVIDENCE_INSUFFICIENT',
@@ -1126,11 +1275,60 @@ export async function verifyNutritionSources(
             },
           ]
         : []),
+      ...(groundedUrls.size > 0 && sources.length === 0
+        ? [
+            {
+              code: 'GROUNDING_SOURCES_REJECTED',
+              message: '搜尋有取得來源，但沒有任何來源能對應到查證結果；營養值已保留為未知。',
+              recoverable: true,
+              suggested_action: '稍後重新查證。',
+            },
+          ]
+        : []),
     ],
     metadata: {
       model,
       retrieved_at: retrievedAt,
       grounding_source_count: groundedUrls.size,
+      grounding_state: grounding.state,
+      grounding_queries: grounding.queries,
+      grounding_finish_reason: grounding.finish_reason,
     },
+  };
+}
+
+/**
+ * 對外入口：重量未知的食物不再阻擋整餐查證。
+ * 未知重量的項目仍會查詢每 100 g 的營養資料，只是無法計算實際攝取量。
+ */
+export async function verifyNutritionSources(
+  composition: ConfirmedComposition,
+): Promise<NutritionVerificationResult> {
+  const result = await runNutritionVerification(composition);
+
+  const itemsWithoutWeight = composition.items.filter(
+    (item) =>
+      !(
+        (typeof item.confirmed_weight_g === 'number' && item.confirmed_weight_g > 0) ||
+        (typeof item.estimated_weight_g === 'number' && item.estimated_weight_g > 0)
+      ),
+  );
+  if (itemsWithoutWeight.length === 0) {
+    return result;
+  }
+
+  return {
+    ...result,
+    status: result.status === 'failed' ? 'failed' : 'partial',
+    errors: [
+      ...result.errors,
+      ...itemsWithoutWeight.map((item) => ({
+        code: 'PORTION_UNCERTAIN',
+        message: `${item.name} 沒有可用重量，已查詢每 100 g 營養資料，但無法計算實際攝取量。`,
+        recoverable: true,
+        item_id: item.item_id,
+        suggested_action: '輸入合理重量；不可填入未測量的精確值。',
+      })),
+    ],
   };
 }

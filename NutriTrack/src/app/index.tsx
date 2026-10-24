@@ -5,6 +5,7 @@ import {
   AppState,
   Image,
   Linking,
+  Modal,
   ScrollView,
   StatusBar,
   StyleSheet,
@@ -22,6 +23,7 @@ import { router } from 'expo-router';
 import * as FileSystem from "expo-file-system/legacy";
 import {
   analyzeFoodImage,
+  analyzeFoodText,
   type DetectedFoodObject,
   type CompositionItem,
 } from "../services/gemini";
@@ -44,7 +46,7 @@ import {
 
 type MealType = "早餐" | "午餐" | "晚餐" | "點心";
 type EntryStep = "closed" | "choose" | "details";
-type InputMode = "photo" | "text";
+type InputMode = "photo" | "text" | "ai_text";
 
 type MealRecord = {
   id: string;
@@ -57,6 +59,7 @@ type MealRecord = {
   carbs: number | null;
   fat: number | null;
   nutritionStatus?: "pending_verification" | "complete" | "partial";
+  nutritionEdited?: boolean;
   confirmedObjects?: DetectedFoodObject[];
   compositionItems?: SavedCompositionItem[];
   nutritionVerification?: NutritionVerificationResult;
@@ -76,6 +79,7 @@ type SavedCompositionItem = {
   weight_status: "user_confirmed" | "ai_estimated" | "unknown";
   evidence_status?: VerificationEvidenceStatus;
   source_ids?: string[];
+  nutrients_edited?: boolean;
   nutrients: {
     energy_kcal: number | null;
     protein_g: number | null;
@@ -83,6 +87,18 @@ type SavedCompositionItem = {
     fat_g: number | null;
   };
 };
+
+type ItemNutrientKey = "energy_kcal" | "protein_g" | "carbohydrate_g" | "fat_g";
+type ItemNutrientDraft = Record<ItemNutrientKey, string>;
+
+const ITEM_NUTRIENT_FIELDS: { key: ItemNutrientKey; label: string }[] = [
+  { key: "energy_kcal", label: "熱量（kcal）" },
+  { key: "protein_g", label: "蛋白質（g）" },
+  { key: "carbohydrate_g", label: "碳水化合物（g）" },
+  { key: "fat_g", label: "脂肪（g）" },
+];
+
+const round1 = (value: number) => Math.round(value * 10) / 10;
 
 type DetectedFood = {
   item_id: string;
@@ -114,12 +130,12 @@ type RecordEditDraft = {
   carbs: string;
   fat: string;
   nutritionStatus?: MealRecord["nutritionStatus"];
+  nutritionEdited?: boolean;
   confirmedObjects?: DetectedFoodObject[];
   compositionItems?: SavedCompositionItem[];
   nutritionVerification?: NutritionVerificationResult;
   nutritionReport?: NutritionReport;
-  compositionInputs: Record<string, CompositionInputDraft>;
-  compositionChanged: boolean;
+  itemNutrients: Record<string, ItemNutrientDraft>;
 };
 
 const STORAGE_KEY = "@NutriTrack/meal_records_v1";
@@ -249,6 +265,105 @@ const readImageAsBase64 = async (imageUri: string) => {
   });
 };
 
+// ───────────── 月曆：每日達成狀況 ─────────────
+
+type DayStatus = "achieved" | "logged" | "none";
+
+type DaySummary = {
+  date: string;
+  records: MealRecord[];
+  calories: number;
+  protein: number;
+  carbs: number;
+  fat: number;
+  hasUnknown: boolean;
+  status: DayStatus;
+};
+
+const WEEKDAY_LABELS = ["日", "一", "二", "三", "四", "五", "六"];
+
+const formatDateKey = (date: Date) => {
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${date.getFullYear()}-${month}-${day}`;
+};
+
+/**
+ * 每日「達成」的判斷集中在這裡；想改規則只要改這個函式。
+ * 目前沿用首頁的規則：當日有紀錄，且熱量已達每日目標 → 達成。
+ * 有紀錄但熱量未達標 → 已紀錄；沒有紀錄 → 無。
+ */
+const summarizeDay = (
+  allRecords: MealRecord[],
+  date: string,
+  targets: DailyTargets
+): DaySummary => {
+  const dayRecords = allRecords.filter((record) => record.date === date);
+  const calories = sum(dayRecords, "calories");
+  const status: DayStatus =
+    dayRecords.length === 0
+      ? "none"
+      : calories >= targets.calories
+        ? "achieved"
+        : "logged";
+
+  return {
+    date,
+    records: dayRecords,
+    calories,
+    protein: sum(dayRecords, "protein"),
+    carbs: sum(dayRecords, "carbs"),
+    fat: sum(dayRecords, "fat"),
+    hasUnknown: dayRecords.some(
+      (record) =>
+        record.calories === null ||
+        record.protein === null ||
+        record.carbs === null ||
+        record.fat === null
+    ),
+    status,
+  };
+};
+
+const summarizeMonth = (
+  allRecords: MealRecord[],
+  year: number,
+  month0: number,
+  targets: DailyTargets
+) => {
+  const daysInMonth = new Date(year, month0 + 1, 0).getDate();
+  const days: DaySummary[] = [];
+  for (let day = 1; day <= daysInMonth; day += 1) {
+    days.push(summarizeDay(allRecords, formatDateKey(new Date(year, month0, day)), targets));
+  }
+  return {
+    days,
+    achievedCount: days.filter((day) => day.status === "achieved").length,
+    loggedCount: days.filter((day) => day.status !== "none").length,
+  };
+};
+
+// 連續達成天數：今天還沒達成時，從昨天開始算，避免一早就歸零。
+const computeStreak = (
+  allRecords: MealRecord[],
+  targets: DailyTargets,
+  todayKey: string
+) => {
+  const cursor = new Date();
+  if (summarizeDay(allRecords, todayKey, targets).status !== "achieved") {
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  let streak = 0;
+  for (let i = 0; i < 366; i += 1) {
+    if (summarizeDay(allRecords, formatDateKey(cursor), targets).status !== "achieved") {
+      break;
+    }
+    streak += 1;
+    cursor.setDate(cursor.getDate() - 1);
+  }
+  return streak;
+};
+
 export default function HomeScreen() {
   const compositionRevision = useRef(0);
   const verificationRequestId = useRef(0);
@@ -284,6 +399,14 @@ export default function HomeScreen() {
   const [compositionDrafts, setCompositionDrafts] = useState<
     Record<string, CompositionInputDraft>
   >({});
+
+  const [aiTextDescription, setAiTextDescription] = useState("");
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  const [calendarCursor, setCalendarCursor] = useState(() => {
+    const now = new Date();
+    return { year: now.getFullYear(), month0: now.getMonth() };
+  });
+  const [selectedCalendarDate, setSelectedCalendarDate] = useState<string>(getToday());
 
   const today = getToday();
   const todayRecords = records.filter((item) => item.date === today);
@@ -530,6 +653,7 @@ export default function HomeScreen() {
     setProtein("");
     setCarbs("");
     setFat("");
+    setAiTextDescription("");
     setSelectedImage(null);
     setAnalysisMealId(null);
     setAiAttempted(false);
@@ -564,6 +688,100 @@ export default function HomeScreen() {
     setNutritionError(null);
     setNutritionSaved(false);
     setVerifyingNutrition(false);
+  };
+
+  const openAiTextEntry = () => {
+    compositionRevision.current += 1;
+    verificationRequestId.current += 1;
+    setInputMode("ai_text");
+    setSelectedImage(null);
+    setAiTextDescription("");
+    setAnalysisMealId(null);
+    setAiAttempted(false);
+    setEntryStep("details");
+    setDetectedFoods([]);
+    setCompositionDrafts({});
+    setCompositionConfirmed(false);
+    setNutritionAnalysis(null);
+    setNutritionError(null);
+    setNutritionSaved(false);
+    setVerifyingNutrition(false);
+  };
+
+  const analyzeFoodFromText = async () => {
+    const description = aiTextDescription.trim();
+    if (!description) {
+      Alert.alert("尚未輸入內容", "請描述你吃了什麼，例如：雞腿便當，白飯、滷雞腿、青菜、滷蛋。");
+      return;
+    }
+
+    compositionRevision.current += 1;
+    verificationRequestId.current += 1;
+    setNutritionAnalysis(null);
+    setNutritionError(null);
+    setNutritionSaved(false);
+    setVerifyingNutrition(false);
+    setAnalyzing(true);
+    setAiAttempted(false);
+    setDetectedFoods([]);
+    setCompositionDrafts({});
+    setCompositionConfirmed(false);
+
+    try {
+      const mealId = `meal-${Date.now()}`;
+      setAnalysisMealId(mealId);
+
+      const result = await analyzeFoodText({ mealId, description });
+
+      if (result.status === "needs_user_input" || result.items.length === 0) {
+        Alert.alert(
+          "尚未解析出食物",
+          result.errors[0]?.message || "請換個方式描述，例如列出每樣食物與份量。"
+        );
+        return;
+      }
+
+      const analyzedFoods: DetectedFood[] = result.items.map((item) => ({
+        item_id: item.item_id,
+        name: item.name,
+        ingredients: item.ingredients ?? [],
+        candidate_names: [],
+        portion_description: item.portion_description,
+        estimated_weight_g: item.estimated_weight_g,
+        confirmed_weight_g: item.confirmed_weight_g,
+        identification_confidence: item.identification_confidence,
+        uncertainty: item.uncertainty,
+      }));
+      setDetectedFoods(analyzedFoods);
+      setCompositionDrafts(createCompositionDrafts(analyzedFoods));
+      setFoodName(analyzedFoods.map((item) => item.name).join("、"));
+      setServing(`${analyzedFoods.length} 項食物`);
+      setAiAttempted(true);
+    } catch (error) {
+      console.error("文字餐點解析失敗：", error);
+      Alert.alert(
+        "餐點解析失敗",
+        error instanceof Error
+          ? error.message
+          : "無法完成解析，請檢查網路、API Key 與 Gemini API 設定。"
+      );
+    } finally {
+      setAnalyzing(false);
+    }
+  };
+
+  const openCalendar = () => {
+    const now = new Date();
+    setCalendarCursor({ year: now.getFullYear(), month0: now.getMonth() });
+    setSelectedCalendarDate(getToday());
+    setCalendarOpen(true);
+  };
+
+  const shiftCalendarMonth = (delta: number) => {
+    setCalendarCursor((previous) => {
+      const next = new Date(previous.year, previous.month0 + delta, 1);
+      return { year: next.getFullYear(), month0: next.getMonth() };
+    });
   };
 
   const takeFoodPhoto = async () => {
@@ -1058,16 +1276,15 @@ export default function HomeScreen() {
   };
 
   const beginRecordEdit = (record: MealRecord) => {
-    const compositionInputs = Object.fromEntries(
+    const itemNutrients: Record<string, ItemNutrientDraft> = Object.fromEntries(
       (record.compositionItems ?? []).map((item) => [
         item.item_id,
-        {
-          name: item.name,
-          ingredients: item.ingredients.join("\n"),
-          candidate_names: item.candidate_names.join("、"),
-          confirmed_weight_g:
-            item.confirmed_weight_g == null ? "" : String(item.confirmed_weight_g),
-        },
+        Object.fromEntries(
+          ITEM_NUTRIENT_FIELDS.map(({ key }) => [
+            key,
+            item.nutrients[key] == null ? "" : String(round1(item.nutrients[key] as number)),
+          ])
+        ) as ItemNutrientDraft,
       ])
     );
 
@@ -1083,66 +1300,43 @@ export default function HomeScreen() {
       carbs: record.carbs == null ? "" : String(record.carbs),
       fat: record.fat == null ? "" : String(record.fat),
       nutritionStatus: record.nutritionStatus,
+      nutritionEdited: record.nutritionEdited,
       confirmedObjects: record.confirmedObjects,
       compositionItems: record.compositionItems,
       nutritionVerification: record.nutritionVerification,
       nutritionReport: record.nutritionReport,
-      compositionInputs,
-      compositionChanged: false,
+      itemNutrients,
     });
   };
 
-  const updateRecordCompositionDraft = (
+  const updateRecordItemNutrient = (
     itemId: string,
-    field: keyof CompositionInputDraft,
+    key: ItemNutrientKey,
     value: string
   ) => {
-    setRecordEditDraft((previous) => {
-      if (!previous) {
-        return previous;
-      }
-
-      const compositionItems = previous.compositionItems?.map((item) => ({
-        ...item,
-        evidence_status: "unresolved" as const,
-        source_ids: [],
-        nutrients: {
-          energy_kcal: null,
-          protein_g: null,
-          carbohydrate_g: null,
-          fat_g: null,
-        },
-      }));
-
-      return {
-        ...previous,
-        compositionInputs: {
-          ...previous.compositionInputs,
-          [itemId]: {
-            ...(previous.compositionInputs[itemId] ?? {
-              name: "",
-              ingredients: "",
-              candidate_names: "",
-              confirmed_weight_g: "",
-            }),
-            [field]: value,
-          },
-        },
-        compositionItems,
-        compositionChanged: true,
-        nutritionStatus: "pending_verification",
-        nutritionVerification: undefined,
-        nutritionReport: undefined,
-      };
-    });
+    setRecordEditDraft((previous) =>
+      previous
+        ? {
+            ...previous,
+            itemNutrients: {
+              ...previous.itemNutrients,
+              [itemId]: {
+                ...(previous.itemNutrients[itemId] ?? {
+                  energy_kcal: "",
+                  protein_g: "",
+                  carbohydrate_g: "",
+                  fat_g: "",
+                }),
+                [key]: value,
+              },
+            },
+          }
+        : previous
+    );
   };
 
   const saveRecordEdit = async () => {
     if (!recordEditDraft) {
-      return;
-    }
-    if (!recordEditDraft.name.trim()) {
-      Alert.alert("請輸入食物名稱", "紀錄名稱不能留空。");
       return;
     }
 
@@ -1153,88 +1347,106 @@ export default function HomeScreen() {
       const parsed = Number(value);
       return Number.isFinite(parsed) && parsed >= 0 ? parsed : NaN;
     };
-    const caloriesValue = recordEditDraft.compositionChanged
-      ? null
-      : parseOptionalNumber(recordEditDraft.calories);
-    const proteinValue = recordEditDraft.compositionChanged
-      ? null
-      : parseOptionalNumber(recordEditDraft.protein);
-    const carbsValue = recordEditDraft.compositionChanged
-      ? null
-      : parseOptionalNumber(recordEditDraft.carbs);
-    const fatValue = recordEditDraft.compositionChanged
-      ? null
-      : parseOptionalNumber(recordEditDraft.fat);
 
-    if ([caloriesValue, proteinValue, carbsValue, fatValue].some(Number.isNaN)) {
-      Alert.alert("營養值不正確", "請輸入非負數字，或留空表示未知。");
-      return;
-    }
+    let updatedRecord: MealRecord;
 
-    let compositionItems = recordEditDraft.compositionItems;
-    if (recordEditDraft.compositionChanged && compositionItems) {
-      let invalidComposition = false;
-      compositionItems = compositionItems.map((item) => {
-        const input = recordEditDraft.compositionInputs[item.item_id];
-        const weightText = input?.confirmed_weight_g.trim() ?? "";
-        const parsedWeight = weightText === "" ? null : Number(weightText);
-        if (
-          !input?.name.trim() ||
-          (parsedWeight != null && (!Number.isFinite(parsedWeight) || parsedWeight <= 0))
-        ) {
-          invalidComposition = true;
+    if (recordEditDraft.compositionItems) {
+      // 有細項的紀錄：只修改各項食物的營養數據，名稱、食材與重量不變。
+      let invalidValue = false;
+      let anyEdited = false;
+      const updatedItems: SavedCompositionItem[] = recordEditDraft.compositionItems.map(
+        (item) => {
+          const input = recordEditDraft.itemNutrients[item.item_id];
+          const nextNutrients = { ...item.nutrients };
+          let itemChanged = false;
+
+          for (const { key } of ITEM_NUTRIENT_FIELDS) {
+            const parsed = parseOptionalNumber(input?.[key] ?? "");
+            if (parsed !== null && Number.isNaN(parsed)) {
+              invalidValue = true;
+              continue;
+            }
+            const original = item.nutrients[key];
+            const originalShown = original == null ? null : round1(original);
+            // 沒有改動的欄位保留原始精確值，避免四捨五入造成誤判為已修改。
+            if (parsed !== originalShown) {
+              nextNutrients[key] = parsed;
+              itemChanged = true;
+            }
+          }
+
+          if (itemChanged) {
+            anyEdited = true;
+          }
+          return itemChanged
+            ? { ...item, nutrients: nextNutrients, nutrients_edited: true }
+            : item;
         }
+      );
 
-        return {
-          ...item,
-          name: input?.name.trim() ?? item.name,
-          ingredients: parseIngredientList(input?.ingredients ?? ""),
-          candidate_names: parseIngredientList(input?.candidate_names ?? ""),
-          confirmed_weight_g:
-            parsedWeight != null && Number.isFinite(parsedWeight) && parsedWeight > 0
-              ? parsedWeight
-              : null,
-          weight_status:
-            parsedWeight != null && Number.isFinite(parsedWeight) && parsedWeight > 0
-              ? "user_confirmed" as const
-              : item.estimated_weight_g != null
-                ? "ai_estimated" as const
-                : "unknown" as const,
-        };
-      });
-
-      if (invalidComposition) {
-        Alert.alert(
-          "組成資料未完成",
-          "請確認每項食物名稱；重量請輸入大於 0 的數值，或留空表示未知。"
-        );
+      if (invalidValue) {
+        Alert.alert("營養值不正確", "請輸入大於或等於 0 的數字，或留空表示未知。");
         return;
       }
+
+      const totalFor = (key: ItemNutrientKey) =>
+        updatedItems.length > 0 && updatedItems.every((item) => item.nutrients[key] != null)
+          ? updatedItems.reduce((total, item) => total + (item.nutrients[key] as number), 0)
+          : null;
+
+      updatedRecord = {
+        id: recordEditDraft.id,
+        date: recordEditDraft.date,
+        meal: recordEditDraft.meal,
+        name: recordEditDraft.name,
+        serving: recordEditDraft.serving,
+        calories: totalFor("energy_kcal"),
+        protein: totalFor("protein_g"),
+        carbs: totalFor("carbohydrate_g"),
+        fat: totalFor("fat_g"),
+        nutritionStatus: recordEditDraft.nutritionStatus,
+        nutritionEdited: recordEditDraft.nutritionEdited || anyEdited || undefined,
+        confirmedObjects: recordEditDraft.confirmedObjects,
+        compositionItems: updatedItems,
+        nutritionVerification: recordEditDraft.nutritionVerification,
+        nutritionReport: recordEditDraft.nutritionReport,
+      };
+    } else {
+      // 手動紀錄（沒有細項）：維持原本的名稱、份量與四項營養值編輯。
+      if (!recordEditDraft.name.trim()) {
+        Alert.alert("請輸入食物名稱", "紀錄名稱不能留空。");
+        return;
+      }
+      const caloriesValue = parseOptionalNumber(recordEditDraft.calories);
+      const proteinValue = parseOptionalNumber(recordEditDraft.protein);
+      const carbsValue = parseOptionalNumber(recordEditDraft.carbs);
+      const fatValue = parseOptionalNumber(recordEditDraft.fat);
+
+      if ([caloriesValue, proteinValue, carbsValue, fatValue].some(Number.isNaN)) {
+        Alert.alert("營養值不正確", "請輸入非負數字，或留空表示未知。");
+        return;
+      }
+
+      updatedRecord = {
+        id: recordEditDraft.id,
+        date: recordEditDraft.date,
+        meal: recordEditDraft.meal,
+        name: recordEditDraft.name.trim(),
+        serving: recordEditDraft.serving.trim(),
+        calories: caloriesValue,
+        protein: proteinValue,
+        carbs: carbsValue,
+        fat: fatValue,
+        nutritionStatus: recordEditDraft.nutritionStatus,
+        nutritionEdited: recordEditDraft.nutritionEdited,
+        confirmedObjects: recordEditDraft.confirmedObjects,
+        compositionItems: recordEditDraft.compositionItems,
+        nutritionVerification: recordEditDraft.nutritionVerification,
+        nutritionReport: recordEditDraft.nutritionReport,
+      };
     }
 
-    const updatedRecord: MealRecord = {
-      id: recordEditDraft.id,
-      date: recordEditDraft.date,
-      meal: recordEditDraft.meal,
-      name: recordEditDraft.name.trim(),
-      serving: recordEditDraft.serving.trim(),
-      calories: caloriesValue,
-      protein: proteinValue,
-      carbs: carbsValue,
-      fat: fatValue,
-      nutritionStatus: recordEditDraft.compositionChanged
-        ? "pending_verification"
-        : recordEditDraft.nutritionStatus,
-      confirmedObjects: recordEditDraft.confirmedObjects,
-      compositionItems,
-      nutritionVerification: recordEditDraft.compositionChanged
-        ? undefined
-        : recordEditDraft.nutritionVerification,
-      nutritionReport: recordEditDraft.compositionChanged
-        ? undefined
-        : recordEditDraft.nutritionReport,
-    };
-
+    const hadItems = Boolean(recordEditDraft.compositionItems);
     setSaving(true);
     try {
       const nextRecords = records.map((record) =>
@@ -1245,8 +1457,8 @@ export default function HomeScreen() {
       setRecordEditDraft(null);
       Alert.alert(
         "已更新紀錄",
-        recordEditDraft.compositionChanged
-          ? "食物組成已更新；舊查證與報告已清除，營養值待重新查證。"
+        hadItems
+          ? "各項營養數據已更新，整筆紀錄的總量已重新計算。"
           : "飲食紀錄已更新。"
       );
     } catch (error) {
@@ -1262,260 +1474,16 @@ export default function HomeScreen() {
     1
   );
 
-  return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="dark-content" backgroundColor="#F5F8F4" />
+  const nowForHeader = new Date();
+  const headerMonth = summarizeMonth(
+    records,
+    nowForHeader.getFullYear(),
+    nowForHeader.getMonth(),
+    dailyTargets
+  );
+  const headerStreak = computeStreak(records, dailyTargets, today);
 
-      <ScrollView
-        contentContainerStyle={styles.container}
-        keyboardShouldPersistTaps="handled"
-      >
-        <View
-          style={{
-            flexDirection: 'row',
-            justifyContent: 'space-between',
-            alignItems: 'center',
-            marginBottom: 16,
-          }}
-        >
-          {/* 左側：標題 */}
-          <View style={{ flex: 1 }}>
-            <Text style={styles.brand}>NutriTrack</Text>
-            <Text style={styles.subtitle}>紀錄並分析每日飲食組成</Text>
-          </View>
-
-          {/* 中間：日期 */}
-          <View style={styles.dateBadge}>
-            <Text style={styles.dateText}>{today}</Text>
-          </View>
-
-          {/* 右側：設定 */}
-          <Pressable
-            onPress={() => router.push('/settings')}
-            style={{
-              paddingVertical: 8,
-              paddingHorizontal: 10,
-              borderRadius: 10,
-              backgroundColor: '#246B45',
-              marginLeft: 10,
-            }}
-          >
-            <Text style={{ color: '#FFFFFF', fontWeight: '600' }}>
-              ⚙️ 設定
-            </Text>
-          </Pressable>
-        </View>
-
-        <View style={styles.calorieCard}>
-          <Text style={styles.cardEyebrow}>今日熱量攝取</Text>
-          <View style={styles.calorieRow}>
-            <Text style={styles.calorieNumber}>
-              {formatNumber(totalCalories)}
-            </Text>
-            <Text style={styles.calorieUnit}>kcal</Text>
-          </View>
-          <Text style={styles.mutedText}>
-            每日目標 {dailyTargets.calories} kcal
-          </Text>
-          {unknownNutritionCount > 0 && (
-            <Text style={styles.pendingNutritionNotice}>
-              {unknownNutritionCount} 筆含未知營養值；今日總量只加總已知數字
-            </Text>
-          )}
-          <View style={styles.progressTrack}>
-            <View
-              style={[
-                styles.progressFill,
-                { width: `${calorieProgress * 100}%` },
-              ]}
-            />
-          </View>
-          <Text style={styles.progressText}>
-            {totalCalories >= dailyTargets.calories
-              ? "已達成今日熱量目標"
-              : `還可攝取 ${formatNumber(
-                  dailyTargets.calories - totalCalories
-                )} kcal`}
-          </Text>
-        </View>
-
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>今日營養概況</Text>
-          <Text style={styles.sectionHint}>目標值僅供參考</Text>
-        </View>
-
-        <View style={styles.nutrientGrid}>
-          <NutrientCard
-            label="蛋白質"
-            value={totalProtein}
-            target={dailyTargets.protein}
-            unit="g"
-            color="#3478C7"
-          />
-
-          <NutrientCard
-            label="碳水化合物"
-            value={totalCarbs}
-            target={dailyTargets.carbs}
-            unit="g"
-            color="#D99035"
-          />
-
-          <NutrientCard
-            label="脂肪"
-            value={totalFat}
-            target={dailyTargets.fat}
-            unit="g"
-            color="#8C69C6"
-          />
-        </View>
-
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>飲食紀錄</Text>
-          <Text style={styles.sectionHint}>
-            {todayRecords.length} 筆
-          </Text>
-        </View>
-
-        {entryStep === "closed" && (
-          <TouchableOpacity
-            style={styles.primaryButton}
-            onPress={openEntry}
-            activeOpacity={0.85}
-          >
-            <Text style={styles.primaryButtonText}>＋ 新增食物紀錄</Text>
-          </TouchableOpacity>
-        )}
-
-        {entryStep === "choose" && (
-          <View style={styles.panel}>
-            <Text style={styles.panelTitle}>如何新增食物？</Text>
-            <Text style={styles.panelDescription}>
-              選擇一種方式開始建立飲食紀錄。
-            </Text>
-
-            <TouchableOpacity
-              style={styles.optionButton}
-              onPress={takeFoodPhoto}
-            >
-              <Text style={styles.optionIcon}>📷</Text>
-              <View style={styles.optionTextContainer}>
-                <Text style={styles.optionTitle}>拍攝餐點</Text>
-                <Text style={styles.optionDescription}>
-                  使用相機拍攝目前的餐點
-                </Text>
-              </View>
-              <Text style={styles.optionArrow}>›</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.optionButton}
-              onPress={chooseFoodPhoto}
-            >
-              <Text style={styles.optionIcon}>🖼️</Text>
-              <View style={styles.optionTextContainer}>
-                <Text style={styles.optionTitle}>從相簿選擇照片</Text>
-                <Text style={styles.optionDescription}>
-                  選擇裝置中已拍攝的餐點照片
-                </Text>
-              </View>
-              <Text style={styles.optionArrow}>›</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.optionButton}
-              onPress={openTextEntry}
-            >
-              <Text style={styles.optionIcon}>✍️</Text>
-              <View style={styles.optionTextContainer}>
-                <Text style={styles.optionTitle}>直接文字輸入</Text>
-                <Text style={styles.optionDescription}>
-                  不需要照片，直接輸入食物與營養資料
-                </Text>
-              </View>
-              <Text style={styles.optionArrow}>›</Text>
-            </TouchableOpacity>
-
-            <TouchableOpacity
-              style={styles.cancelButton}
-              onPress={() => setEntryStep("closed")}
-            >
-              <Text style={styles.cancelButtonText}>取消</Text>
-            </TouchableOpacity>
-          </View>
-        )}
-
-        {entryStep === "details" && (
-          <View style={styles.panel}>
-            <View style={styles.formHeader}>
-              <Text style={styles.panelTitle}>編輯食物資料</Text>
-              <TouchableOpacity onPress={clearForm}>
-                <Text style={styles.cancelLink}>取消新增</Text>
-              </TouchableOpacity>
-            </View>
-
-            {inputMode === "photo" && selectedImage && (
-              <View style={styles.previewCard}>
-                <Image
-                  source={{ uri: selectedImage }}
-                  style={styles.previewImage}
-                  resizeMode="contain"
-                />
-                <View style={styles.previewInfo}>
-                  <Text style={styles.previewTitle}>餐點照片已選取</Text>
-                  <Text style={styles.previewDescription}>
-                    請確認照片，並手動核對食物與營養資料。
-                  </Text>
-                  <TouchableOpacity
-                    onPress={() => setSelectedImage(null)}
-                  >
-                    <Text style={styles.removePhotoText}>移除照片</Text>
-                  </TouchableOpacity>
-                </View>
-                <TouchableOpacity
-                  style={[
-                    styles.secondaryButton,
-                    analyzing && styles.disabledButton,
-                  ]}
-                  onPress={analyzeFood}
-                  disabled={analyzing}
-                >
-                  {analyzing ? (
-                    <ActivityIndicator color="#28764A" />
-                  ) : (
-                    <Text style={styles.secondaryButtonText}>
-                      AI 辨識食物組成
-                    </Text>
-                  )}
-                </TouchableOpacity>
-                <Text style={styles.noticeText}>
-                  AI 會直接辨識照片中的食物、可見食材與估計重量。
-                </Text>
-
-                <Text style={styles.fieldLabel}>餐別</Text>
-                <View style={styles.mealSelector}>
-                  {MEALS.map((meal) => (
-                    <TouchableOpacity
-                      key={meal}
-                      style={[
-                        styles.mealChip,
-                        selectedMeal === meal && styles.mealChipActive,
-                      ]}
-                      onPress={() => setSelectedMeal(meal)}
-                    >
-                      <Text
-                        style={[
-                          styles.mealChipText,
-                          selectedMeal === meal && styles.mealChipTextActive,
-                        ]}
-                      >
-                        {meal}
-                      </Text>
-                    </TouchableOpacity>
-                  ))}
-                </View>
-
-                {aiAttempted && (
+  const compositionSection = aiAttempted && (
                   <View style={{ marginTop: 14, gap: 12 }}>
                     <Text style={styles.noticeSuccess}>
                       已分析 {detectedFoods.length} 項食物，請確認名稱、食材與重量。
@@ -1550,12 +1518,6 @@ export default function HomeScreen() {
 
                         <Text style={styles.previewDescription}>
                           份量描述：{item.portion_description || "待確認"}
-                        </Text>
-                        <Text style={styles.previewDescription}>
-                          AI 估計重量：
-                          {item.estimated_weight_g == null
-                            ? "目前無可靠估計，請自行確認"
-                            : `約 ${formatNumber(item.estimated_weight_g)} g（估計值，非實際測量）`}
                         </Text>
 
                         <Text style={styles.fieldLabel}>內部食材（可由照片確認）</Text>
@@ -1690,9 +1652,6 @@ export default function HomeScreen() {
 
                     {compositionConfirmed && (
                       <View style={{ gap: 12 }}>
-                        <Text style={styles.previewDescription}>
-                          查證會將已確認食物名稱送交 Gemini 網路搜尋；可能依你的 API 帳戶方案計費。
-                        </Text>
 
                         {nutritionError && (
                           <Text style={styles.nutritionErrorText}>
@@ -1857,8 +1816,360 @@ export default function HomeScreen() {
                     )}
 
                   </View>
-                )}
+                );
 
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="dark-content"/>
+
+      <ScrollView
+        contentContainerStyle={styles.container}
+        keyboardShouldPersistTaps="handled"
+      >
+        <View
+          style={{
+            flexDirection: 'row',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            marginBottom: 16,
+          }}
+        >
+          {/* 左側：標題 */}
+          <View style={{ flex: 1 }}>
+            <Text style={styles.brand}>NutriTrack</Text>
+            <Text style={styles.subtitle}>紀錄並分析每日飲食組成</Text>
+          </View>
+
+          {/* 中間：日期 */}
+          <Pressable style={styles.dateBadge} onPress={openCalendar}>
+            <Text style={styles.dateText}>📅 {today}</Text>
+          </Pressable>
+
+          {/* 右側：設定 */}
+          <Pressable
+            onPress={() => router.push('/settings')}
+            style={{
+              paddingVertical: 8,
+              paddingHorizontal: 10,
+              borderRadius: 10,
+              backgroundColor: '#246B45',
+              marginLeft: 10,
+            }}
+          >
+            <Text style={{ color: '#FFFFFF', fontWeight: '600' }}>
+              ⚙️ 設定
+            </Text>
+          </Pressable>
+        </View>
+
+        <Pressable style={styles.monthStrip} onPress={openCalendar}>
+          <View style={{ flex: 1 }}>
+            <Text style={styles.monthStripTitle}>
+              本月達成 {headerMonth.achievedCount} 天
+              {headerStreak > 0 ? ` · 連續 ${headerStreak} 天` : ""}
+            </Text>
+            <Text style={styles.monthStripHint}>點擊查看月曆與每日達成狀況</Text>
+          </View>
+          <View style={styles.monthDots}>
+            {headerMonth.days.map((day) => (
+              <View
+                key={day.date}
+                style={[
+                  styles.monthDot,
+                  day.status === "achieved" && styles.monthDotAchieved,
+                  day.status === "logged" && styles.monthDotLogged,
+                  day.date === today && styles.monthDotToday,
+                ]}
+              />
+            ))}
+          </View>
+        </Pressable>
+
+        <View style={styles.calorieCard}>
+          <Text style={styles.cardEyebrow}>今日熱量攝取</Text>
+          <View style={styles.calorieRow}>
+            <Text style={styles.calorieNumber}>
+              {formatNumber(totalCalories)}
+            </Text>
+            <Text style={styles.calorieUnit}>kcal</Text>
+          </View>
+          <Text style={styles.mutedText}>
+            每日目標 {dailyTargets.calories} kcal
+          </Text>
+          {unknownNutritionCount > 0 && (
+            <Text style={styles.pendingNutritionNotice}>
+              {unknownNutritionCount} 筆含未知營養值；今日總量只加總已知數字
+            </Text>
+          )}
+          <View style={styles.progressTrack}>
+            <View
+              style={[
+                styles.progressFill,
+                { width: `${calorieProgress * 100}%` },
+              ]}
+            />
+          </View>
+          <Text style={styles.progressText}>
+            {totalCalories >= dailyTargets.calories
+              ? "已達成今日熱量目標"
+              : `還可攝取 ${formatNumber(
+                  dailyTargets.calories - totalCalories
+                )} kcal`}
+          </Text>
+        </View>
+
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>今日營養概況</Text>
+          <Text style={styles.sectionHint}>目標值僅供參考</Text>
+        </View>
+
+        <View style={styles.nutrientGrid}>
+          <NutrientCard
+            label="蛋白質"
+            value={totalProtein}
+            target={dailyTargets.protein}
+            unit="g"
+            color="#3478C7"
+          />
+
+          <NutrientCard
+            label="碳水化合物"
+            value={totalCarbs}
+            target={dailyTargets.carbs}
+            unit="g"
+            color="#D99035"
+          />
+
+          <NutrientCard
+            label="脂肪"
+            value={totalFat}
+            target={dailyTargets.fat}
+            unit="g"
+            color="#8C69C6"
+          />
+        </View>
+
+        <View style={styles.sectionHeader}>
+          <Text style={styles.sectionTitle}>飲食紀錄</Text>
+          <Text style={styles.sectionHint}>
+            {todayRecords.length} 筆
+          </Text>
+        </View>
+
+        {entryStep === "closed" && (
+          <TouchableOpacity
+            style={styles.primaryButton}
+            onPress={openEntry}
+            activeOpacity={0.85}
+          >
+            <Text style={styles.primaryButtonText}>＋ 新增食物紀錄</Text>
+          </TouchableOpacity>
+        )}
+
+        {entryStep === "choose" && (
+          <View style={styles.panel}>
+            <Text style={styles.panelTitle}>如何新增食物？</Text>
+            <Text style={styles.panelDescription}>
+              選擇一種方式開始建立飲食紀錄。
+            </Text>
+
+            <TouchableOpacity
+              style={styles.optionButton}
+              onPress={takeFoodPhoto}
+            >
+              <Text style={styles.optionIcon}>📷</Text>
+              <View style={styles.optionTextContainer}>
+                <Text style={styles.optionTitle}>拍攝餐點</Text>
+                <Text style={styles.optionDescription}>
+                  使用相機拍攝目前的餐點
+                </Text>
+              </View>
+              <Text style={styles.optionArrow}>›</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.optionButton}
+              onPress={chooseFoodPhoto}
+            >
+              <Text style={styles.optionIcon}>🖼️</Text>
+              <View style={styles.optionTextContainer}>
+                <Text style={styles.optionTitle}>從相簿選擇照片</Text>
+                <Text style={styles.optionDescription}>
+                  選擇裝置中已拍攝的餐點照片
+                </Text>
+              </View>
+              <Text style={styles.optionArrow}>›</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.optionButton}
+              onPress={openAiTextEntry}
+            >
+              <Text style={styles.optionIcon}>🤖</Text>
+              <View style={styles.optionTextContainer}>
+                <Text style={styles.optionTitle}>文字描述，交給 AI 辨識</Text>
+                <Text style={styles.optionDescription}>
+                  輸入食物與組成，由 AI 整理食材並查證營養
+                </Text>
+              </View>
+              <Text style={styles.optionArrow}>›</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.optionButton}
+              onPress={openTextEntry}
+            >
+              <Text style={styles.optionIcon}>✍️</Text>
+              <View style={styles.optionTextContainer}>
+                <Text style={styles.optionTitle}>直接文字輸入</Text>
+                <Text style={styles.optionDescription}>
+                  不需要照片，自己輸入食物與營養數值
+                </Text>
+              </View>
+              <Text style={styles.optionArrow}>›</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity
+              style={styles.cancelButton}
+              onPress={() => setEntryStep("closed")}
+            >
+              <Text style={styles.cancelButtonText}>取消</Text>
+            </TouchableOpacity>
+          </View>
+        )}
+
+        {entryStep === "details" && (
+          <View style={styles.panel}>
+            <View style={styles.formHeader}>
+              <Text style={styles.panelTitle}>編輯食物資料</Text>
+              <TouchableOpacity onPress={clearForm}>
+                <Text style={styles.cancelLink}>取消新增</Text>
+              </TouchableOpacity>
+            </View>
+
+            {inputMode === "photo" && selectedImage && (
+              <View style={styles.previewCard}>
+                <Image
+                  source={{ uri: selectedImage }}
+                  style={styles.previewImage}
+                  resizeMode="contain"
+                />
+                <View style={styles.previewInfo}>
+                  <Text style={styles.previewTitle}>餐點照片已選取</Text>
+                  <Text style={styles.previewDescription}>
+                    請確認照片，並手動核對食物與營養資料。
+                  </Text>
+                  <TouchableOpacity
+                    onPress={() => setSelectedImage(null)}
+                  >
+                    <Text style={styles.removePhotoText}>移除照片</Text>
+                  </TouchableOpacity>
+                </View>
+                <TouchableOpacity
+                  style={[
+                    styles.secondaryButton,
+                    analyzing && styles.disabledButton,
+                  ]}
+                  onPress={analyzeFood}
+                  disabled={analyzing}
+                >
+                  {analyzing ? (
+                    <ActivityIndicator color="#28764A" />
+                  ) : (
+                    <Text style={styles.secondaryButtonText}>
+                      AI 辨識食物組成
+                    </Text>
+                  )}
+                </TouchableOpacity>
+                <Text style={styles.noticeText}>
+                  AI 會直接辨識照片中的食物、可見食材與估計重量。
+                </Text>
+
+                <Text style={styles.fieldLabel}>餐別</Text>
+                <View style={styles.mealSelector}>
+                  {MEALS.map((meal) => (
+                    <TouchableOpacity
+                      key={meal}
+                      style={[
+                        styles.mealChip,
+                        selectedMeal === meal && styles.mealChipActive,
+                      ]}
+                      onPress={() => setSelectedMeal(meal)}
+                    >
+                      <Text
+                        style={[
+                          styles.mealChipText,
+                          selectedMeal === meal && styles.mealChipTextActive,
+                        ]}
+                      >
+                        {meal}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {compositionSection}
+
+              </View>
+            )}
+
+            {inputMode === "ai_text" && (
+              <View style={{ gap: 4 }}>
+                <Text style={styles.fieldLabel}>餐別</Text>
+                <View style={styles.mealSelector}>
+                  {MEALS.map((meal) => (
+                    <TouchableOpacity
+                      key={meal}
+                      style={[
+                        styles.mealChip,
+                        selectedMeal === meal && styles.mealChipActive,
+                      ]}
+                      onPress={() => setSelectedMeal(meal)}
+                    >
+                      <Text
+                        style={[
+                          styles.mealChipText,
+                          selectedMeal === meal && styles.mealChipTextActive,
+                        ]}
+                      >
+                        {meal}
+                      </Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                <Text style={styles.fieldLabel}>描述你吃的餐點與組成 *</Text>
+                <TextInput
+                  style={[styles.input, { minHeight: 110, textAlignVertical: "top" }]}
+                  placeholder={"例如：雞腿便當，白飯約200g、滷雞腿一支、炒青菜、滷蛋一顆"}
+                  placeholderTextColor="#9AA49A"
+                  value={aiTextDescription}
+                  onChangeText={setAiTextDescription}
+                  multiline
+                  maxLength={1000}
+                />
+                <Text style={styles.noticeText}>
+                  可以寫食物、食材與重量；沒寫的重量 AI 會估計，下一步你可以再確認與修改。
+                </Text>
+
+                <TouchableOpacity
+                  style={[
+                    styles.secondaryButton,
+                    analyzing && styles.disabledButton,
+                  ]}
+                  onPress={analyzeFoodFromText}
+                  disabled={analyzing}
+                >
+                  {analyzing ? (
+                    <ActivityIndicator color="#28764A" />
+                  ) : (
+                    <Text style={styles.secondaryButtonText}>
+                      AI 辨識食物組成
+                    </Text>
+                  )}
+                </TouchableOpacity>
+
+                {compositionSection}
               </View>
             )}
 
@@ -2001,7 +2312,9 @@ export default function HomeScreen() {
           todayRecords.map((record) => {
             const isExpanded = expandedRecordId === record.id;
             const isEditing = recordEditDraft?.id === record.id;
-            const statusLabel = record.nutritionStatus === "complete"
+            const statusLabel = record.nutritionEdited
+              ? "含手動修改"
+              : record.nutritionStatus === "complete"
               ? "來源已查證"
               : record.nutritionStatus === "partial"
                 ? "含估算/未知"
@@ -2058,16 +2371,20 @@ export default function HomeScreen() {
 
                 {isEditing && recordEditDraft ? (
                   <View style={{ marginTop: 12, gap: 8 }}>
-                    <Text style={styles.fieldLabel}>紀錄名稱</Text>
-                    <TextInput
-                      style={styles.input}
-                      value={recordEditDraft.name}
-                      onChangeText={(value) =>
-                        setRecordEditDraft((previous) => previous
-                          ? { ...previous, name: value }
-                          : previous)
-                      }
-                    />
+                    {!recordEditDraft.compositionItems && (
+                      <>
+                        <Text style={styles.fieldLabel}>紀錄名稱</Text>
+                        <TextInput
+                          style={styles.input}
+                          value={recordEditDraft.name}
+                          onChangeText={(value) =>
+                            setRecordEditDraft((previous) => previous
+                              ? { ...previous, name: value }
+                              : previous)
+                          }
+                        />
+                      </>
+                    )}
                     <Text style={styles.fieldLabel}>餐別</Text>
                     <View style={styles.mealSelector}>
                       {MEALS.map((meal) => (
@@ -2094,68 +2411,66 @@ export default function HomeScreen() {
                         </TouchableOpacity>
                       ))}
                     </View>
-                    <Text style={styles.fieldLabel}>份量摘要</Text>
-                    <TextInput
-                      style={styles.input}
-                      value={recordEditDraft.serving}
-                      onChangeText={(value) =>
-                        setRecordEditDraft((previous) => previous
-                          ? { ...previous, serving: value }
-                          : previous)
-                      }
-                    />
+                    {!recordEditDraft.compositionItems && (
+                      <>
+                        <Text style={styles.fieldLabel}>份量摘要</Text>
+                        <TextInput
+                          style={styles.input}
+                          value={recordEditDraft.serving}
+                          onChangeText={(value) =>
+                            setRecordEditDraft((previous) => previous
+                              ? { ...previous, serving: value }
+                              : previous)
+                          }
+                        />
+                      </>
+                    )}
 
                     {recordEditDraft.compositionItems ? (
                       <View style={{ gap: 8 }}>
+                        <Text style={styles.previewDescription}>
+                          修改各項食物的營養數據；食物名稱、食材與重量不會改變。留空表示未知。
+                        </Text>
                         {recordEditDraft.compositionItems.map((item) => {
-                          const input = recordEditDraft.compositionInputs[item.item_id];
+                          const input = recordEditDraft.itemNutrients[item.item_id];
+                          const weightLabel =
+                            item.confirmed_weight_g != null
+                              ? `${formatNumber(item.confirmed_weight_g)} g（已確認）`
+                              : item.estimated_weight_g != null
+                                ? `約 ${formatNumber(item.estimated_weight_g)} g（AI 估計）`
+                                : "重量未知";
                           return (
                             <View key={item.item_id} style={styles.recordEditItem}>
-                              <TextInput
-                                style={styles.input}
-                                value={input?.name ?? item.name}
-                                onChangeText={(value) =>
-                                  updateRecordCompositionDraft(item.item_id, "name", value)
-                                }
-                                placeholder="食物名稱"
-                                autoCorrect={false}
-                                spellCheck={false}
-                              />
-                              <TextInput
-                                style={styles.input}
-                                value={input?.confirmed_weight_g ?? ""}
-                                onChangeText={(value) =>
-                                  updateRecordCompositionDraft(item.item_id, "confirmed_weight_g", value)
-                                }
-                                placeholder="確認重量（g）；留空表示未知"
-                                keyboardType="decimal-pad"
-                              />
-                              <TextInput
-                                style={[styles.input, styles.multilineRecordInput]}
-                                value={input?.ingredients ?? ""}
-                                onChangeText={(value) =>
-                                  updateRecordCompositionDraft(item.item_id, "ingredients", value)
-                                }
-                                placeholder="已確認食材，每行一項"
-                                multiline
-                              />
-                              <TextInput
-                                style={[styles.input, styles.multilineRecordInput]}
-                                value={input?.candidate_names ?? ""}
-                                onChangeText={(value) =>
-                                  updateRecordCompositionDraft(item.item_id, "candidate_names", value)
-                                }
-                                placeholder="待確認食材候選"
-                                multiline
-                              />
+                              <Text style={styles.recordMacros}>{item.name}</Text>
+                              <Text style={styles.recordServing}>
+                                {weightLabel}
+                                {item.nutrients_edited
+                                  ? " · 已手動修改"
+                                  : item.evidence_status
+                                    ? ` · ${evidenceStatusLabel(item.evidence_status)}`
+                                    : ""}
+                              </Text>
+                              {ITEM_NUTRIENT_FIELDS.map(({ key, label }) => (
+                                <View key={key}>
+                                  <Text style={styles.fieldLabel}>{label}</Text>
+                                  <TextInput
+                                    style={styles.input}
+                                    value={input?.[key] ?? ""}
+                                    onChangeText={(value) =>
+                                      updateRecordItemNutrient(item.item_id, key, value)
+                                    }
+                                    placeholder="留空表示未知"
+                                    placeholderTextColor="#9AA49A"
+                                    keyboardType="decimal-pad"
+                                  />
+                                </View>
+                              ))}
                             </View>
                           );
                         })}
-                        {recordEditDraft.compositionChanged && (
-                          <Text style={styles.previewDescription}>
-                            保存後會清除舊查證與報告，營養值改為待查證。
-                          </Text>
-                        )}
+                        <Text style={styles.previewDescription}>
+                          手動修改的數值不再視為來源查證值，會標示為「已手動修改」。
+                        </Text>
                       </View>
                     ) : (
                       <View style={{ gap: 8 }}>
@@ -2215,11 +2530,15 @@ export default function HomeScreen() {
                         <Text style={styles.recordMacros}>
                           {item.name}
                         </Text>
-                        {item.evidence_status && (
+                        {(item.nutrients_edited || item.evidence_status) && (
                           <Text style={styles.recordServing}>
-                            {item.evidence_status === "estimated"
-                              ? "AI估算（無外部查證）"
-                              : evidenceStatusLabel(item.evidence_status)}
+                            {item.nutrients_edited
+                              ? "手動修改（非來源查證）"
+                              : item.evidence_status === "estimated"
+                                ? "AI估算（無外部查證）"
+                                : item.evidence_status
+                                  ? evidenceStatusLabel(item.evidence_status)
+                                  : ""}
                           </Text>
                         )}
                         {item.ingredients.length > 0 && (
@@ -2272,6 +2591,158 @@ export default function HomeScreen() {
           NutriTrack · 紀錄僅供個人飲食追蹤參考
         </Text>
       </ScrollView>
+
+      <Modal
+        visible={calendarOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setCalendarOpen(false)}
+      >
+        <Pressable
+          style={styles.calendarBackdrop}
+          onPress={() => setCalendarOpen(false)}
+        >
+          <Pressable style={styles.calendarCard} onPress={() => {}}>
+            {(() => {
+              const { year, month0 } = calendarCursor;
+              const month = summarizeMonth(records, year, month0, dailyTargets);
+              const firstWeekday = new Date(year, month0, 1).getDay();
+              const cells: (DaySummary | null)[] = [
+                ...Array.from({ length: firstWeekday }, () => null),
+                ...month.days,
+              ];
+              const selected = summarizeDay(records, selectedCalendarDate, dailyTargets);
+              const selectedNutrients = [
+                { label: "熱量", value: selected.calories, target: dailyTargets.calories, unit: "kcal" },
+                { label: "蛋白質", value: selected.protein, target: dailyTargets.protein, unit: "g" },
+                { label: "碳水化合物", value: selected.carbs, target: dailyTargets.carbs, unit: "g" },
+                { label: "脂肪", value: selected.fat, target: dailyTargets.fat, unit: "g" },
+              ];
+
+              return (
+                <ScrollView showsVerticalScrollIndicator={false}>
+                  <View style={styles.calendarHeader}>
+                    <TouchableOpacity onPress={() => shiftCalendarMonth(-1)} style={styles.calendarNav}>
+                      <Text style={styles.calendarNavText}>‹</Text>
+                    </TouchableOpacity>
+                    <Text style={styles.calendarTitle}>
+                      {year} 年 {month0 + 1} 月
+                    </Text>
+                    <TouchableOpacity onPress={() => shiftCalendarMonth(1)} style={styles.calendarNav}>
+                      <Text style={styles.calendarNavText}>›</Text>
+                    </TouchableOpacity>
+                  </View>
+
+                  <Text style={styles.calendarSummary}>
+                    本月達成 {month.achievedCount} 天 · 有紀錄 {month.loggedCount} 天
+                  </Text>
+
+                  <View style={styles.calendarRow}>
+                    {WEEKDAY_LABELS.map((label) => (
+                      <Text key={label} style={styles.calendarWeekday}>
+                        {label}
+                      </Text>
+                    ))}
+                  </View>
+
+                  <View style={styles.calendarGrid}>
+                    {cells.map((day, index) => {
+                      if (!day) {
+                        return <View key={`blank-${index}`} style={styles.calendarCell} />;
+                      }
+                      const dayNumber = Number(day.date.slice(8, 10));
+                      const isSelected = day.date === selectedCalendarDate;
+                      return (
+                        <View key={day.date} style={styles.calendarCell}>
+                          <Pressable
+                            onPress={() => setSelectedCalendarDate(day.date)}
+                            style={[
+                              styles.calendarDay,
+                              day.status === "achieved" && styles.calendarDayAchieved,
+                              day.status === "logged" && styles.calendarDayLogged,
+                              day.date === today && styles.calendarDayToday,
+                              isSelected && styles.calendarDaySelected,
+                              day.date > today && { opacity: 0.45 },
+                            ]}
+                          >
+                            <Text
+                              style={[
+                                styles.calendarDayText,
+                                day.status === "achieved" && { color: "#FFFFFF" },
+                              ]}
+                            >
+                              {dayNumber}
+                            </Text>
+                          </Pressable>
+                        </View>
+                      );
+                    })}
+                  </View>
+
+                  <View style={styles.calendarLegend}>
+                    <View style={[styles.legendSwatch, { backgroundColor: "#246B45" }]} />
+                    <Text style={styles.legendText}>達成</Text>
+                    <View style={[styles.legendSwatch, { backgroundColor: "#DCE8D8" }]} />
+                    <Text style={styles.legendText}>已紀錄</Text>
+                    <View style={[styles.legendSwatch, { backgroundColor: "#FFFFFF", borderWidth: 1, borderColor: "#D6DED3" }]} />
+                    <Text style={styles.legendText}>無紀錄</Text>
+                  </View>
+                  <Text style={styles.calendarRule}>
+                    「達成」＝ 當日熱量達到每日目標（與首頁判斷相同），以目前設定的目標計算。
+                  </Text>
+
+                  <View style={styles.calendarDetail}>
+                    <Text style={styles.calendarDetailTitle}>
+                      {selected.date}
+                      {selected.status === "achieved"
+                        ? " · 已達成"
+                        : selected.status === "logged"
+                          ? " · 已紀錄，未達標"
+                          : " · 沒有紀錄"}
+                    </Text>
+
+                    {selected.records.length > 0 && (
+                      <>
+                        {selectedNutrients.map((nutrient) => {
+                          const percent = Math.round((nutrient.value / nutrient.target) * 100);
+                          return (
+                            <View key={nutrient.label} style={styles.calendarNutrientRow}>
+                              <Text style={styles.calendarNutrientLabel}>{nutrient.label}</Text>
+                              <Text style={styles.calendarNutrientValue}>
+                                {formatNumber(nutrient.value)} / {nutrient.target} {nutrient.unit}
+                                {"  "}({percent}%)
+                                {nutrient.value >= nutrient.target ? " ✓" : ""}
+                              </Text>
+                            </View>
+                          );
+                        })}
+                        {selected.hasUnknown && (
+                          <Text style={styles.calendarRule}>
+                            部分紀錄含未知營養值，只加總已知數字。
+                          </Text>
+                        )}
+                        {selected.records.map((record) => (
+                          <Text key={record.id} style={styles.calendarRecordLine}>
+                            {record.meal}・{record.name}
+                            {record.calories == null ? "" : `（${formatNumber(record.calories)} kcal）`}
+                          </Text>
+                        ))}
+                      </>
+                    )}
+                  </View>
+
+                  <TouchableOpacity
+                    style={[styles.cancelButton, { marginTop: 14 }]}
+                    onPress={() => setCalendarOpen(false)}
+                  >
+                    <Text style={styles.cancelButtonText}>關閉</Text>
+                  </TouchableOpacity>
+                </ScrollView>
+              );
+            })()}
+          </Pressable>
+        </Pressable>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -2631,12 +3102,13 @@ const styles = StyleSheet.create({
     marginTop: 8,
   },
   secondaryButton: {
-    minHeight: 43,
+    minHeight: 50,
     borderRadius: 11,
     backgroundColor: "#E5F0E3",
     alignItems: "center",
     justifyContent: "center",
-    marginTop: 13,
+    marginTop: 1,
+    paddingHorizontal: 16,
   },
   secondaryButtonText: {
     color: "#28764A",
@@ -2869,4 +3341,126 @@ const styles = StyleSheet.create({
     fontSize: 12,
     fontWeight: "700",
   },
+  monthStrip: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    backgroundColor: "#FFFFFF",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "#E2E9E0",
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    marginBottom: 14,
+    gap: 10,
+  },
+  monthStripTitle: {
+    color: "#286B47",
+    fontSize: 14,
+    fontWeight: "700",
+  },
+  monthStripHint: {
+    color: "#8A978A",
+    fontSize: 11,
+    marginTop: 2,
+  },
+  monthDots: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    width: 112,
+    gap: 3,
+    justifyContent: "flex-end",
+  },
+  monthDot: {
+    width: 9,
+    height: 9,
+    borderRadius: 3,
+    backgroundColor: "#E7ECE5",
+  },
+  monthDotAchieved: { backgroundColor: "#246B45" },
+  monthDotLogged: { backgroundColor: "#A9CDB4" },
+  monthDotToday: { borderWidth: 1.5, borderColor: "#D99035" },
+  calendarBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(20, 30, 20, 0.45)",
+    justifyContent: "center",
+    padding: 16,
+  },
+  calendarCard: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 18,
+    padding: 16,
+    maxHeight: "90%",
+  },
+  calendarHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 6,
+  },
+  calendarNav: { paddingHorizontal: 14, paddingVertical: 4 },
+  calendarNavText: { fontSize: 26, color: "#246B45", fontWeight: "700" },
+  calendarTitle: { fontSize: 17, fontWeight: "700", color: "#23332A" },
+  calendarSummary: {
+    textAlign: "center",
+    color: "#5F7064",
+    fontSize: 12,
+    marginBottom: 10,
+  },
+  calendarRow: { flexDirection: "row", marginBottom: 4 },
+  calendarWeekday: {
+    width: "14.2857%",
+    textAlign: "center",
+    color: "#8A978A",
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  calendarGrid: { flexDirection: "row", flexWrap: "wrap" },
+  calendarCell: { width: "14.2857%", aspectRatio: 1, padding: 2 },
+  calendarDay: {
+    flex: 1,
+    borderRadius: 10,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#FFFFFF",
+    borderWidth: 1,
+    borderColor: "#EEF2EC",
+  },
+  calendarDayAchieved: { backgroundColor: "#246B45", borderColor: "#246B45" },
+  calendarDayLogged: { backgroundColor: "#DCE8D8", borderColor: "#DCE8D8" },
+  calendarDayToday: { borderWidth: 2, borderColor: "#D99035" },
+  calendarDaySelected: { borderWidth: 2, borderColor: "#3478C7" },
+  calendarDayText: { fontSize: 14, color: "#334338", fontWeight: "600" },
+  calendarLegend: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    marginTop: 10,
+  },
+  legendSwatch: { width: 12, height: 12, borderRadius: 4 },
+  legendText: { fontSize: 12, color: "#5F7064", marginRight: 8 },
+  calendarRule: {
+    color: "#8A978A",
+    fontSize: 11,
+    textAlign: "center",
+    marginTop: 6,
+  },
+  calendarDetail: {
+    marginTop: 14,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: "#F3F7F0",
+    borderWidth: 1,
+    borderColor: "#DCE8D8",
+    gap: 6,
+  },
+  calendarDetailTitle: { fontSize: 14, fontWeight: "700", color: "#286B47" },
+  calendarNutrientRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+  },
+  calendarNutrientLabel: { fontSize: 13, color: "#4A5A4E" },
+  calendarNutrientValue: { fontSize: 13, color: "#23332A", fontWeight: "600" },
+  calendarRecordLine: { fontSize: 12, color: "#5F7064" },
 });
